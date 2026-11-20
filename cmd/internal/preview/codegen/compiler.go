@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
+	"time"
 
 	"github.com/k-kohey/axe/internal/preview/buildlock"
 )
@@ -26,25 +29,42 @@ func ReplacementModuleName(moduleName, sourceFileName string, counter int) strin
 // The compile and link steps are unified into a single swiftc invocation
 // that takes multiple .swift files and produces a .dylib directly.
 func CompileThunk(ctx context.Context, thunkPaths []string, cfg CompileConfig, thunkDir, buildDir string, reloadCounter int, sourceFileName string, tc ToolchainRunner) (string, error) {
+	t0 := time.Now()
 	sdk, err := tc.SDKPath(ctx, "iphonesimulator")
+	tSDK := time.Since(t0)
 	if err != nil {
 		return "", fmt.Errorf("getting simulator SDK path: %w", err)
 	}
-	target := fmt.Sprintf("arm64-apple-ios%s-simulator", cfg.DeploymentTarget)
+	arch := cfg.TargetArch
+	if arch == "" {
+		if runtime.GOARCH == "amd64" {
+			arch = "x86_64"
+		} else {
+			arch = "arm64"
+		}
+	}
+	target := fmt.Sprintf("%s-apple-ios%s-simulator", arch, cfg.DeploymentTarget)
 
 	replacementModule := ReplacementModuleName(cfg.ModuleName, sourceFileName, reloadCounter)
 
 	dylibPath := filepath.Join(thunkDir, fmt.Sprintf("thunk_%d.dylib", reloadCounter))
 
 	// Compile and link under shared lock (reads BuiltProductsDir).
+	t1 := time.Now()
 	if err := compileAndLink(ctx, cfg, buildDir, sdk, target, replacementModule, thunkPaths, dylibPath, tc); err != nil {
 		return "", err
 	}
+	tCompile := time.Since(t1)
 
-	// codesign only touches thunkDir — no lock needed.
+	// codesign only touches thunkDir: no lock needed.
+	t2 := time.Now()
 	if err := tc.Codesign(ctx, dylibPath); err != nil {
 		return "", fmt.Errorf("codesigning dylib: %w", err)
 	}
+	tSign := time.Since(t2)
+
+	fmt.Fprintf(os.Stderr, "[axe-compile] sdk=%.3fs, compileAndLink=%.3fs, codesign=%.3fs, total=%.3fs\n",
+		tSDK.Seconds(), tCompile.Seconds(), tSign.Seconds(), time.Since(t0).Seconds())
 
 	slog.Debug("Thunk dylib ready", "path", dylibPath)
 	return dylibPath, nil
@@ -55,31 +75,38 @@ func CompileThunk(ctx context.Context, thunkPaths []string, cfg CompileConfig, t
 // access private members via @_private(sourceFile:) imports. Each per-file thunk
 // scopes its @_private import to a single source file, preventing private type collisions.
 func compileAndLink(ctx context.Context, cfg CompileConfig, buildDir, sdk, target, replacementModule string, thunkPaths []string, dylibPath string, tc ToolchainRunner) error {
+	t0 := time.Now()
 	lock := buildlock.New(buildDir)
 	if err := lock.RLock(ctx); err != nil {
 		return fmt.Errorf("acquiring read lock: %w", err)
 	}
 	defer lock.RUnlock()
+	tLock := time.Since(t0)
+
+	moduleCacheDir := filepath.Join(buildDir, "module-cache")
+	_ = os.MkdirAll(moduleCacheDir, 0o755)
 
 	// .swift files -> .dylib (unified compile+link)
 	args := []string{
 		"xcrun", "swiftc",
 		"-emit-library",
-		"-enforce-exclusivity=checked",
+		"-enforce-exclusivity=none",
 		"-DDEBUG",
 		"-sdk", sdk,
 		"-target", target,
 		"-enable-testing",
+		"-no-link-objc-runtime",
 		"-I", cfg.BuiltProductsDir,
 		"-F", cfg.BuiltProductsDir,
 		"-L", cfg.BuiltProductsDir,
 		"-module-name", replacementModule,
 		"-parse-as-library",
 		"-Onone",
-		"-gline-tables-only",
+		"-module-cache-path", moduleCacheDir,
 		"-Xfrontend", "-disable-previous-implementation-calls-in-dynamic-replacements",
 		"-Xfrontend", "-disable-modules-validate-system-headers",
 		"-Xfrontend", "-enable-private-imports",
+		"-Xfrontend", "-empty-abi-descriptor",
 		"-Xlinker", "-undefined",
 		"-Xlinker", "suppress",
 		"-Xlinker", "-flat_namespace",
@@ -104,9 +131,12 @@ func compileAndLink(ctx context.Context, cfg CompileConfig, buildDir, sdk, targe
 		args = append(args, "-swift-version", sv)
 	}
 	slog.Debug("Compiling thunk .swift -> .dylib", "args", args)
+	fmt.Fprintf(os.Stderr, "[axe-swiftc-args] %v\n", args)
+	tSwift := time.Now()
 	if out, err := tc.CompileSwift(ctx, args); err != nil {
 		return fmt.Errorf("compiling thunk: %w\n%s", err, out)
 	}
+	fmt.Fprintf(os.Stderr, "[axe-swiftc] lock=%.3fs, compileSwift=%.3fs\n", tLock.Seconds(), time.Since(tSwift).Seconds())
 
 	return nil
 }

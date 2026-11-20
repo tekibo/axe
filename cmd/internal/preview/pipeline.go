@@ -143,12 +143,27 @@ func compileFullThunkFiles(
 	counter int,
 	tc ToolchainRunner,
 ) (string, error) {
+	return compileFullThunkFilesWithPreviews(ctx, sourceFile, files, nil, cache, bs, dirs, previewSelector, counter, tc)
+}
+
+func compileFullThunkFilesWithPreviews(
+	ctx context.Context,
+	sourceFile string,
+	files []analysis.FileThunkData,
+	previews []analysis.PreviewBlock,
+	cache *analysis.IndexStoreCache,
+	bs *build.Settings,
+	dirs previewDirs,
+	previewSelector string,
+	counter int,
+	tc ToolchainRunner,
+) (string, error) {
 	if len(files) == 0 {
 		return "", fmt.Errorf("no types found in tracked files")
 	}
 
 	moduleName := moduleNameForSettings(sourceFile, bs, cache)
-	thunkPaths, err := codegen.GenerateThunks(files, moduleName, dirs.Thunk, previewSelector, sourceFile, counter)
+	thunkPaths, err := codegen.GenerateUnifiedThunks(files, previews, moduleName, dirs.Thunk, previewSelector, sourceFile, counter)
 	if err != nil {
 		return "", fmt.Errorf("thunk: %w", err)
 	}
@@ -230,7 +245,7 @@ func compileMainOnlyPipeline(
 
 // deploy attempts hot-reload via socket, falling back to full app relaunch.
 func deploy(ctx context.Context, dylibPath string, dirs previewDirs, bs *build.Settings, wctx watchContext) error {
-	if err := codegen.SendReloadCommand(ctx, dirs.Socket, dylibPath); err != nil {
+	if _, err := codegen.SendReloadCommand(ctx, dirs.Socket, dylibPath); err != nil {
 		slog.Warn("Hot-reload failed, falling back to full relaunch", "err", err)
 		terminateApp(ctx, bs, wctx.device, wctx.deviceSetPath, wctx.app)
 		if err := launchWithHotReload(ctx, bs, wctx.loaderPath, dylibPath, dirs.Socket, wctx.device, wctx.deviceSetPath, wctx.app); err != nil {

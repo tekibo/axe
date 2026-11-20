@@ -149,7 +149,7 @@ func (sm *StreamManager) simruntimeStreamLauncher(ctx context.Context, s *stream
 		return
 	}
 
-	loaderPath, err := codegen.CompileLoader(ctx, s.dirs.Loader, bs.DeploymentTarget, sm.toolchain)
+	loaderPath, err := codegen.CompileLoader(ctx, s.dirs.Loader, bs.DeploymentTarget, bs.TargetArch, sm.toolchain)
 	if err != nil {
 		s.sendStopped(sm.ew, "build_error", err.Error(), "")
 		return

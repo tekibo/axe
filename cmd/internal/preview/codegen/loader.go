@@ -6,10 +6,12 @@ import (
 	"crypto/sha256"
 	_ "embed"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -29,16 +31,23 @@ import (
 var loaderSource string
 
 // LoaderCacheKey computes a SHA256 cache key from the loader source,
-// SDK path, and deployment target. This ensures the cached dylib is
+// SDK path, deployment target, and architecture. This ensures the cached dylib is
 // invalidated when any of these change (e.g. Xcode update).
-func LoaderCacheKey(source, sdk, deploymentTarget string) string {
-	hashInput := source + "\x00" + sdk + "\x00" + deploymentTarget
+func LoaderCacheKey(source, sdk, deploymentTarget, arch string) string {
+	hashInput := source + "\x00" + sdk + "\x00" + deploymentTarget + "\x00" + arch
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(hashInput)))
 }
 
 // CompileLoader compiles the Obj-C loader dylib for the simulator.
 // The result is cached: recompilation is skipped if the source hash matches.
-func CompileLoader(ctx context.Context, loaderDir, deploymentTarget string, tc ToolchainRunner) (string, error) {
+func CompileLoader(ctx context.Context, loaderDir, deploymentTarget, arch string, tc ToolchainRunner) (string, error) {
+	if arch == "" {
+		if runtime.GOARCH == "amd64" {
+			arch = "x86_64"
+		} else {
+			arch = "arm64"
+		}
+	}
 	if err := os.MkdirAll(loaderDir, 0o755); err != nil {
 		return "", fmt.Errorf("creating loader dir: %w", err)
 	}
@@ -53,7 +62,7 @@ func CompileLoader(ctx context.Context, loaderDir, deploymentTarget string, tc T
 	}
 
 	// Check if source hash matches the cached build
-	currentHash := LoaderCacheKey(loaderSource, sdk, deploymentTarget)
+	currentHash := LoaderCacheKey(loaderSource, sdk, deploymentTarget, arch)
 	if _, err := os.Stat(dylibPath); err == nil {
 		if cached, err := os.ReadFile(hashPath); err == nil && string(cached) == currentHash {
 			slog.Debug("Loader dylib cached, skipping compile", "path", dylibPath)
@@ -66,7 +75,7 @@ func CompileLoader(ctx context.Context, loaderDir, deploymentTarget string, tc T
 		return "", fmt.Errorf("writing loader source: %w", err)
 	}
 
-	target := fmt.Sprintf("arm64-apple-ios%s-simulator", deploymentTarget)
+	target := fmt.Sprintf("%s-apple-ios%s-simulator", arch, deploymentTarget)
 
 	compileArgs := []string{
 		"xcrun", "clang",
@@ -149,35 +158,45 @@ func WaitForReady(ctx context.Context, socketPath string) error {
 
 // SendReloadCommand connects to the loader's Unix domain socket and sends
 // a dylib path for hot-reload. It retries with exponential backoff if the
-// socket is not yet ready.
-func SendReloadCommand(ctx context.Context, socketPath, dylibPath string) error {
+// socket is not yet ready. Returns in-app snapshot PNG bytes if provided.
+func SendReloadCommand(ctx context.Context, socketPath, dylibPath string) ([]byte, error) {
 	conn, err := dialWithRetry(ctx, socketPath, sendReloadBackoffs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
 
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	if _, err := fmt.Fprintf(conn, "%s\n", dylibPath); err != nil {
-		return fmt.Errorf("sending dylib path: %w", err)
+		return nil, fmt.Errorf("sending dylib path: %w", err)
 	}
 
-	scanner := bufio.NewScanner(conn)
-	if !scanner.Scan() {
-		if err := scanner.Err(); err != nil {
-			return fmt.Errorf("reading response: %w", err)
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	line = strings.TrimSpace(line)
+
+	if after, ok := strings.CutPrefix(line, "ERR:"); ok {
+		return nil, fmt.Errorf("loader error: %s", after)
+	}
+	if !strings.HasPrefix(line, "OK") {
+		return nil, fmt.Errorf("unexpected loader response: %s", line)
+	}
+
+	var screenshot []byte
+	parts := strings.Fields(line)
+	if len(parts) >= 2 {
+		var length int
+		if _, err := fmt.Sscanf(parts[1], "%d", &length); err == nil && length > 0 {
+			screenshot = make([]byte, length)
+			if _, err := io.ReadFull(reader, screenshot); err != nil {
+				return nil, fmt.Errorf("reading screenshot payload (%d bytes): %w", length, err)
+			}
 		}
-		return fmt.Errorf("no response from loader")
 	}
 
-	resp := scanner.Text()
-	if after, ok := strings.CutPrefix(resp, "ERR:"); ok {
-		return fmt.Errorf("loader error: %s", after)
-	}
-	if resp != "OK" {
-		return fmt.Errorf("unexpected loader response: %s", resp)
-	}
-
-	return nil
+	return screenshot, nil
 }

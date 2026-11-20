@@ -69,7 +69,7 @@ func resolveAgainst(root, p string) string {
 	return filepath.Join(root, p)
 }
 
-var targetTriple = regexp.MustCompile(`-ios([0-9.]+)-simulator$`)
+var targetTriple = regexp.MustCompile(`^(?:([a-zA-Z0-9_]+)-apple-)?ios([0-9.]+)-simulator$`)
 
 // Settings converts BuildInfo into the Settings axe uses for thunk compilation and launching.
 func (b *BuildInfo) Settings() (*Settings, error) {
@@ -100,7 +100,12 @@ func (b *BuildInfo) Settings() (*Settings, error) {
 		switch {
 		case arg == "-target" && next != "":
 			if m := targetTriple.FindStringSubmatch(next); m != nil {
-				s.DeploymentTarget = m[1]
+				if len(m) > 2 && m[1] != "" {
+					s.TargetArch = m[1]
+					s.DeploymentTarget = m[2]
+				} else {
+					s.DeploymentTarget = m[len(m)-1]
+				}
 			}
 		case arg == "-swift-version" && next != "":
 			s.SwiftVersion = next

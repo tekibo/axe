@@ -6,6 +6,7 @@ type CompileConfig struct {
 	ModuleName       string
 	BuiltProductsDir string
 	DeploymentTarget string
+	TargetArch       string
 	SwiftVersion     string
 
 	ExtraIncludePaths   []string // additional -I paths (SPM C module headers)

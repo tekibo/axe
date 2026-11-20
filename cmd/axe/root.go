@@ -14,9 +14,10 @@ var appName string
 var verbose bool
 
 var rootCmd = &cobra.Command{
-	Use:   "axe",
-	Short: "Alternative Xcode Environment — command-line development tools for iOS simulators",
-	Long:  "axe (Alternative Xcode Environment) provides command-line development tools for iOS simulators.",
+	Use:          "axe",
+	Short:        "Alternative Xcode Environment: command-line development tools for iOS simulators",
+	Long:         "axe (Alternative Xcode Environment) provides command-line development tools for iOS simulators.",
+	SilenceUsage: true,
 }
 
 func main() {

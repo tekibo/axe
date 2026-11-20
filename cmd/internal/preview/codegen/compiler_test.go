@@ -114,6 +114,7 @@ func TestCompileThunk_CompileSwiftArgs(t *testing.T) {
 	cfg := CompileConfig{
 		ModuleName:          "TestModule",
 		BuiltProductsDir:    filepath.Join(tmpDir, "products"),
+		TargetArch:          "arm64",
 		DeploymentTarget:    "17.0",
 		SwiftVersion:        "6.0",
 		ExtraIncludePaths:   []string{"/extra/include"},

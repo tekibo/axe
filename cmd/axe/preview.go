@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,11 +27,15 @@ var (
 	previewSelector   string
 	previewReuseBuild bool
 	previewFullThunk  bool
+	previewKeepAlive  bool
+	previewDaemon     bool
+	previewOutput     string
 )
 
 var previewCmd = &cobra.Command{
-	Use:   "preview <source-file.swift>",
-	Short: "Launch a SwiftUI preview via dynamic replacement",
+	Use:          "preview <source-file.swift>",
+	Short:        "Launch a SwiftUI preview via dynamic replacement",
+	SilenceUsage: true,
 	Long: `Aiming to reproduce the behavior of Xcode Previews,
 	this command builds the project, extracts the View body from the source file, generates a @_dynamicReplacement thunk,
 	compiles it into a dylib, and launches the app on a headless simulator with the dylib injected.
@@ -99,10 +104,22 @@ func runOneshotLogic(sourceArg string) error {
 		PC:              pc,
 		PreviewSelector: previewSelector,
 		PreferredDevice: previewDevice,
+		DeviceUDID:      previewDevice,
 		ReuseBuild:      previewReuseBuild,
 		FullThunk:       previewFullThunk,
+		KeepAlive:       previewKeepAlive,
+		Daemon:          previewDaemon,
+		OutputPath:      previewOutput,
 	}
 	opts.OnScreenshot = func(_ context.Context, data []byte) error {
+		if previewOutput != "" {
+			return os.WriteFile(previewOutput, data, 0644)
+		}
+		if previewDaemon {
+			b64 := base64.StdEncoding.EncodeToString(data)
+			_, err = fmt.Fprintf(os.Stdout, "FRAME %s\n", b64)
+			return err
+		}
 		_, err = os.Stdout.Write(data)
 		return err
 	}
@@ -262,7 +279,10 @@ func init() {
 	// Oneshot-specific flags.
 	previewCmd.Flags().StringVar(&previewSelector, "preview", "", "select preview by title or index (e.g. --preview \"Dark Mode\" or --preview 1)")
 	previewCmd.Flags().BoolVar(&previewReuseBuild, "reuse-build", false, "skip xcodebuild and reuse artifacts from a previous build")
-	previewCmd.Flags().BoolVar(&previewFullThunk, "full-thunk", false, "use full thunk compilation in oneshot mode (per-file dynamic replacement)")
+	previewCmd.Flags().BoolVar(&previewFullThunk, "full-thunk", true, "use full thunk compilation in oneshot mode (per-file dynamic replacement)")
+	previewCmd.Flags().BoolVar(&previewKeepAlive, "keep-alive", true, "keep preview app alive on simulator for fast subsequent reloads")
+	previewCmd.Flags().BoolVar(&previewDaemon, "daemon", false, "run as persistent interactive daemon reading reload commands from stdin")
+	previewCmd.Flags().StringVar(&previewOutput, "output", "", "write screenshot to specific output file path")
 
 	rootCmd.AddCommand(previewCmd)
 }

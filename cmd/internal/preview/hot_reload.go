@@ -682,8 +682,8 @@ func handleNextPreviewCmd(
 // cleanOldDylibs removes thunk dylib, object, and Swift files older than keepAfter.
 func cleanOldDylibs(thunkDir string, keepAfter int) {
 	for i := range keepAfter {
-		// Remove dylib and legacy .o files.
-		for _, ext := range []string{".dylib", ".o"} {
+		// Remove dylib, unified swift, and legacy .o files.
+		for _, ext := range []string{".dylib", ".o", ".swift"} {
 			p := filepath.Join(thunkDir, fmt.Sprintf("thunk_%d%s", i, ext))
 			if err := os.Remove(p); err == nil {
 				slog.Debug("Cleaned old thunk artifact", "path", p)

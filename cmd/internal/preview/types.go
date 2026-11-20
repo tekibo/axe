@@ -33,6 +33,9 @@ type RunOptions struct {
 	PreferredDevice string
 	ReuseBuild      bool
 	FullThunk       bool
+	KeepAlive       bool
+	Daemon          bool
+	OutputPath      string
 	Strict          bool
 	NoHeadless      bool
 	MaxThunkFiles   int // max tracked files for incremental thunk (0 = unlimited)
@@ -73,6 +76,7 @@ func compileConfigFromSettings(s *build.Settings) codegen.CompileConfig {
 		ModuleName:          s.ModuleName,
 		BuiltProductsDir:    s.BuiltProductsDir,
 		DeploymentTarget:    s.DeploymentTarget,
+		TargetArch:          s.TargetArch,
 		SwiftVersion:        s.SwiftVersion,
 		ExtraIncludePaths:   s.ExtraIncludePaths,
 		ExtraFrameworkPaths: s.ExtraFrameworkPaths,

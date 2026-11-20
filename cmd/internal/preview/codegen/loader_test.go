@@ -3,6 +3,7 @@ package codegen
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -25,25 +26,26 @@ func withLoaderBackoffs(t *testing.T, waitBackoffs, reloadBackoffs []time.Durati
 }
 
 func TestLoaderCacheKey_IncludesAllInputs(t *testing.T) {
-	base := LoaderCacheKey("source", "/sdk/path", "17.0")
+	base := LoaderCacheKey("source", "/sdk/path", "17.0", "arm64")
 
 	// Same inputs must produce the same key
-	if got := LoaderCacheKey("source", "/sdk/path", "17.0"); got != base {
+	if got := LoaderCacheKey("source", "/sdk/path", "17.0", "arm64"); got != base {
 		t.Errorf("same inputs produced different keys: %s vs %s", got, base)
 	}
 
 	// Changing any single input must produce a different key
 	tests := []struct {
-		name             string
-		source, sdk, dep string
+		name                   string
+		source, sdk, dep, arch string
 	}{
-		{"different source", "source2", "/sdk/path", "17.0"},
-		{"different sdk", "source", "/sdk/path2", "17.0"},
-		{"different deployment target", "source", "/sdk/path", "18.0"},
+		{"different source", "source2", "/sdk/path", "17.0", "arm64"},
+		{"different sdk", "source", "/sdk/path2", "17.0", "arm64"},
+		{"different deployment target", "source", "/sdk/path", "18.0", "arm64"},
+		{"different arch", "source", "/sdk/path", "17.0", "x86_64"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := LoaderCacheKey(tt.source, tt.sdk, tt.dep); got == base {
+			if got := LoaderCacheKey(tt.source, tt.sdk, tt.dep, tt.arch); got == base {
 				t.Errorf("expected different key for %s, got same: %s", tt.name, got)
 			}
 		})
@@ -53,15 +55,15 @@ func TestLoaderCacheKey_IncludesAllInputs(t *testing.T) {
 func TestLoaderCacheKey_NoDelimiterCollision(t *testing.T) {
 	// Fields that share a boundary must not collide.
 	// e.g. shifting content across the delimiter boundary must produce a different key.
-	a := LoaderCacheKey("src", "/sdk/path", "17.0")
-	b := LoaderCacheKey("src\x00/sdk", "path", "17.0")
+	a := LoaderCacheKey("src", "/sdk/path", "17.0", "arm64")
+	b := LoaderCacheKey("src\x00/sdk", "path", "17.0", "arm64")
 	if a == b {
 		t.Error("delimiter collision: different field boundaries produced the same key")
 	}
 }
 
 func TestLoaderCacheKey_Format(t *testing.T) {
-	key := LoaderCacheKey("src", "/sdk", "17.0")
+	key := LoaderCacheKey("src", "/sdk", "17.0", "arm64")
 	// SHA256 hex digest is 64 characters
 	if len(key) != 64 {
 		t.Errorf("expected 64-char hex digest, got %d chars: %s", len(key), key)
@@ -94,7 +96,7 @@ func TestSendReloadCommand_OK(t *testing.T) {
 		_, _ = conn.Write([]byte("OK\n"))
 	}()
 
-	err = SendReloadCommand(context.Background(), sockPath, "/tmp/thunk_0.dylib")
+	_, err = SendReloadCommand(context.Background(), sockPath, "/tmp/thunk_0.dylib")
 	if err != nil {
 		t.Fatalf("SendReloadCommand returned error: %v", err)
 	}
@@ -102,6 +104,38 @@ func TestSendReloadCommand_OK(t *testing.T) {
 	<-done
 	if received != "/tmp/thunk_0.dylib\n" {
 		t.Errorf("received = %q, want %q", received, "/tmp/thunk_0.dylib\n")
+	}
+}
+
+func TestSendReloadCommand_WithScreenshot(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "test.sock")
+
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	fakePNG := []byte("fake-png-screenshot-bytes")
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		buf := make([]byte, 4096)
+		_, _ = conn.Read(buf)
+		_, _ = fmt.Fprintf(conn, "OK %d\n", len(fakePNG))
+		_, _ = conn.Write(fakePNG)
+	}()
+
+	shot, err := SendReloadCommand(context.Background(), sockPath, "/tmp/thunk_0.dylib")
+	if err != nil {
+		t.Fatalf("SendReloadCommand returned error: %v", err)
+	}
+	if string(shot) != string(fakePNG) {
+		t.Fatalf("got screenshot %q, want %q", string(shot), string(fakePNG))
 	}
 }
 
@@ -126,7 +160,7 @@ func TestSendReloadCommand_Error(t *testing.T) {
 		_, _ = conn.Write([]byte("ERR:dlopen failed: symbol not found\n"))
 	}()
 
-	err = SendReloadCommand(context.Background(), sockPath, "/tmp/thunk_0.dylib")
+	_, err = SendReloadCommand(context.Background(), sockPath, "/tmp/thunk_0.dylib")
 	if err == nil {
 		t.Fatal("expected error for ERR response")
 	}
@@ -142,7 +176,7 @@ func TestSendReloadCommand_NoSocket(t *testing.T) {
 	// Remove socket file to make sure it doesn't exist
 	_ = os.Remove(sockPath)
 
-	err := SendReloadCommand(context.Background(), sockPath, "/tmp/thunk_0.dylib")
+	_, err := SendReloadCommand(context.Background(), sockPath, "/tmp/thunk_0.dylib")
 	if err == nil {
 		t.Fatal("expected error when socket does not exist")
 	}
@@ -261,7 +295,7 @@ func TestLoaderSocketBackoffPolicies_SplitBehavior(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	if err := SendReloadCommand(ctx, sockPath, "/tmp/thunk_0.dylib"); err == nil {
+	if _, err := SendReloadCommand(ctx, sockPath, "/tmp/thunk_0.dylib"); err == nil {
 		t.Fatal("expected SendReloadCommand to fail with shorter reload backoff")
 	}
 
@@ -307,7 +341,7 @@ func TestCompileLoader_Success(t *testing.T) {
 	loaderDir := filepath.Join(t.TempDir(), "loader")
 	tc := &fakeLoaderToolchain{sdkPathResult: "/sdk/iphonesimulator"}
 
-	dylibPath, err := CompileLoader(context.Background(), loaderDir, "17.0", tc)
+	dylibPath, err := CompileLoader(context.Background(), loaderDir, "17.0", "arm64", tc)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -348,7 +382,7 @@ func TestCompileLoader_CacheHit(t *testing.T) {
 	tc := &fakeLoaderToolchain{sdkPathResult: "/sdk/iphonesimulator"}
 
 	// First call: compiles.
-	dylibPath1, err := CompileLoader(context.Background(), loaderDir, "17.0", tc)
+	dylibPath1, err := CompileLoader(context.Background(), loaderDir, "17.0", "arm64", tc)
 	if err != nil {
 		t.Fatalf("first compile error: %v", err)
 	}
@@ -360,7 +394,7 @@ func TestCompileLoader_CacheHit(t *testing.T) {
 
 	// Second call with a fresh toolchain: should skip compilation due to cache.
 	tc2 := &fakeLoaderToolchain{sdkPathResult: "/sdk/iphonesimulator"}
-	dylibPath2, err := CompileLoader(context.Background(), loaderDir, "17.0", tc2)
+	dylibPath2, err := CompileLoader(context.Background(), loaderDir, "17.0", "arm64", tc2)
 	if err != nil {
 		t.Fatalf("second compile error: %v", err)
 	}
@@ -382,7 +416,7 @@ func TestCompileLoader_CacheMiss_DifferentTarget(t *testing.T) {
 	tc := &fakeLoaderToolchain{sdkPathResult: "/sdk/iphonesimulator"}
 
 	// First compile with deployment target 17.0.
-	dylibPath, err := CompileLoader(context.Background(), loaderDir, "17.0", tc)
+	dylibPath, err := CompileLoader(context.Background(), loaderDir, "17.0", "arm64", tc)
 	if err != nil {
 		t.Fatalf("first compile error: %v", err)
 	}
@@ -394,7 +428,7 @@ func TestCompileLoader_CacheMiss_DifferentTarget(t *testing.T) {
 
 	// Second compile with different deployment target should recompile.
 	tc2 := &fakeLoaderToolchain{sdkPathResult: "/sdk/iphonesimulator"}
-	_, err = CompileLoader(context.Background(), loaderDir, "18.0", tc2)
+	_, err = CompileLoader(context.Background(), loaderDir, "18.0", "arm64", tc2)
 	if err != nil {
 		t.Fatalf("second compile error: %v", err)
 	}
@@ -413,7 +447,7 @@ func TestCompileLoader_CacheMiss_DifferentSDK(t *testing.T) {
 	tc := &fakeLoaderToolchain{sdkPathResult: "/sdk/iphonesimulator15"}
 
 	// First compile.
-	dylibPath, err := CompileLoader(context.Background(), loaderDir, "17.0", tc)
+	dylibPath, err := CompileLoader(context.Background(), loaderDir, "17.0", "arm64", tc)
 	if err != nil {
 		t.Fatalf("first compile error: %v", err)
 	}
@@ -425,7 +459,7 @@ func TestCompileLoader_CacheMiss_DifferentSDK(t *testing.T) {
 
 	// Second compile with different SDK path should recompile.
 	tc2 := &fakeLoaderToolchain{sdkPathResult: "/sdk/iphonesimulator16"}
-	_, err = CompileLoader(context.Background(), loaderDir, "17.0", tc2)
+	_, err = CompileLoader(context.Background(), loaderDir, "17.0", "arm64", tc2)
 	if err != nil {
 		t.Fatalf("second compile error: %v", err)
 	}
@@ -475,7 +509,7 @@ func TestCompileLoader_ErrorPropagation(t *testing.T) {
 
 			loaderDir := filepath.Join(t.TempDir(), "loader")
 
-			_, err := CompileLoader(context.Background(), loaderDir, "17.0", tt.tc)
+			_, err := CompileLoader(context.Background(), loaderDir, "17.0", "arm64", tt.tc)
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}

@@ -14,9 +14,9 @@ func TestCleanOldDylibs_RemovesOldArtifacts(t *testing.T) {
 
 	dir := t.TempDir()
 
-	// Create thunk_0 through thunk_2 (.dylib and .o).
+	// Create thunk_0 through thunk_2 (.dylib, .o, and .swift).
 	for i := range 3 {
-		for _, ext := range []string{".dylib", ".o"} {
+		for _, ext := range []string{".dylib", ".o", ".swift"} {
 			p := filepath.Join(dir, fmt.Sprintf("thunk_%d%s", i, ext))
 			if err := os.WriteFile(p, []byte("fake"), 0o644); err != nil {
 				t.Fatal(err)
@@ -29,7 +29,7 @@ func TestCleanOldDylibs_RemovesOldArtifacts(t *testing.T) {
 
 	// thunk_0 and thunk_1 should be removed.
 	for i := range 2 {
-		for _, ext := range []string{".dylib", ".o"} {
+		for _, ext := range []string{".dylib", ".o", ".swift"} {
 			p := filepath.Join(dir, fmt.Sprintf("thunk_%d%s", i, ext))
 			if _, err := os.Stat(p); err == nil {
 				t.Errorf("expected %s to be removed", p)
@@ -38,7 +38,7 @@ func TestCleanOldDylibs_RemovesOldArtifacts(t *testing.T) {
 	}
 
 	// thunk_2 should still exist.
-	for _, ext := range []string{".dylib", ".o"} {
+	for _, ext := range []string{".dylib", ".o", ".swift"} {
 		p := filepath.Join(dir, fmt.Sprintf("thunk_%d%s", 2, ext))
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("expected %s to still exist", p)

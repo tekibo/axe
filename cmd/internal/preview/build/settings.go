@@ -13,6 +13,7 @@ type Settings struct {
 	OriginalBundleID string // original bundle ID from xcodebuild
 	BuiltProductsDir string
 	DeploymentTarget string
+	TargetArch       string
 	SwiftVersion     string
 
 	// Fields below are populated by ExtractCompilerPaths after build.

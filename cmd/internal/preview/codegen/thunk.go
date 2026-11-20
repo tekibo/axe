@@ -19,6 +19,7 @@ var thunkFuncMap = template.FuncMap{
 		s = strings.ReplaceAll(s, `"`, `\"`)
 		return s
 	},
+	"hasPrefix": strings.HasPrefix,
 }
 
 // PerFileThunkTmpl generates a per-file thunk that imports only its own source file
@@ -35,13 +36,13 @@ import SwiftUI
 {{ .Source }}
         #sourceLocation()
     }
-{{ end }}{{ range .Methods }}    @_dynamicReplacement(for: {{ .Selector }})
+{{ end }}{{ range .Methods }}{{ if and (ne .Name "init") (not (hasPrefix .Selector "init(")) }}    @_dynamicReplacement(for: {{ .Selector }})
     private func __preview__{{ .Name }}{{ .Signature }} {
         #sourceLocation(file: "{{ $filePath | escapeSwiftString }}", line: {{ .BodyLine }})
 {{ .Source }}
         #sourceLocation()
     }
-{{ end }}}
+{{ end }}{{ end }}}
 {{ end }}`))
 
 // MainThunkTmpl generates the main thunk containing the preview wrapper and
@@ -50,6 +51,7 @@ import SwiftUI
 // that file.
 var MainThunkTmpl = template.Must(template.New("mainThunk").Funcs(thunkFuncMap).Parse(
 	`import SwiftUI
+import Foundation
 {{ range .ExtraImports }}{{ . }}
 {{ end }}{{ if .HasPreview }}
 @_private(sourceFile: "{{ .TargetFileName | escapeSwiftString }}") import {{ .ModuleName }}
@@ -59,20 +61,24 @@ struct _AxePreviewWrapper: View {
 {{ end }}
     var body: some View {
 {{ .PreviewBody }}
+        .id(UUID())
     }
 }
 {{ end }}
 import UIKit
 
+@MainActor
 @_cdecl("axe_preview_refresh")
 public func _axePreviewRefresh() {
 {{ if .HasPreview }}
     let hc = UIHostingController(rootView: AnyView(_AxePreviewWrapper()))
     for scene in UIApplication.shared.connectedScenes {
         guard let ws = scene as? UIWindowScene else { continue }
-        guard let window = ws.windows.first else { continue }
+        guard let window = ws.windows.first(where: { $0.isKeyWindow }) ?? ws.windows.first else { continue }
         window.rootViewController = hc
         window.makeKeyAndVisible()
+        window.layoutIfNeeded()
+        CATransaction.flush()
         break
     }
 {{ end }}
@@ -98,6 +104,74 @@ type MainThunkData struct {
 	PreviewBody    string
 }
 
+// GenerateUnifiedThunks generates a single unified thunk file when only one source file is tracked,
+// enabling swiftc to compile the entire thunk in a single frontend job without secondary process spawns.
+// Falls back to per-file thunks when multiple files are tracked.
+func GenerateUnifiedThunks(
+	files []analysis.FileThunkData,
+	previews []analysis.PreviewBlock,
+	moduleName string,
+	thunkDir string,
+	previewSelector string,
+	targetSourceFile string,
+	reloadCounter int,
+) ([]string, error) {
+	if len(files) == 1 {
+		if err := os.MkdirAll(thunkDir, 0o755); err != nil {
+			return nil, fmt.Errorf("creating thunk dir: %w", err)
+		}
+		cleanOldThunkFiles(thunkDir, reloadCounter)
+
+		f := files[0]
+		fileModuleName := f.ModuleName
+		if fileModuleName == "" {
+			fileModuleName = moduleName
+		}
+
+		td := PerFileThunkData{
+			FileName:     f.FileName,
+			AbsPath:      f.AbsPath,
+			ModuleName:   fileModuleName,
+			ExtraImports: f.Imports,
+			Types:        f.Types,
+		}
+
+		mtd := MainThunkData{
+			ModuleName:     moduleName,
+			TargetFileName: filepath.Base(targetSourceFile),
+			ExtraImports:   f.Imports,
+		}
+
+		if err := resolvePreviewWithExplicit(&mtd, targetSourceFile, previewSelector, previews); err != nil {
+			return nil, err
+		}
+
+		unifiedPath := filepath.Join(thunkDir, fmt.Sprintf("thunk_%d.swift", reloadCounter))
+		file, err := os.OpenFile(unifiedPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			return nil, fmt.Errorf("creating unified thunk file: %w", err)
+		}
+		if err := PerFileThunkTmpl.Execute(file, td); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("rendering per-file template into unified thunk: %w", err)
+		}
+		if _, err := file.WriteString("\n\n"); err != nil {
+			file.Close()
+			return nil, err
+		}
+		if err := MainThunkTmpl.Execute(file, mtd); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("rendering main template into unified thunk: %w", err)
+		}
+		file.Close()
+
+		slog.Debug("Generated single unified thunk (single-job mode)", "path", unifiedPath)
+		return []string{unifiedPath}, nil
+	}
+
+	return GenerateThunksWithPreviews(files, previews, moduleName, thunkDir, previewSelector, targetSourceFile, reloadCounter)
+}
+
 // GenerateThunks generates per-file thunks and a main thunk.
 // Each per-file thunk has its own @_private(sourceFile:) import, so private types
 // from different files never collide. The main thunk contains the preview wrapper
@@ -106,6 +180,20 @@ type MainThunkData struct {
 // Returns the list of all generated thunk paths (per-file + main).
 func GenerateThunks(
 	files []analysis.FileThunkData,
+	moduleName string,
+	thunkDir string,
+	previewSelector string,
+	targetSourceFile string,
+	reloadCounter int,
+) ([]string, error) {
+	return GenerateThunksWithPreviews(files, nil, moduleName, thunkDir, previewSelector, targetSourceFile, reloadCounter)
+}
+
+// GenerateThunksWithPreviews is identical to GenerateThunks but accepts an optional pre-parsed
+// slice of PreviewBlocks to avoid re-parsing the AST when previews are already known.
+func GenerateThunksWithPreviews(
+	files []analysis.FileThunkData,
+	previews []analysis.PreviewBlock,
 	moduleName string,
 	thunkDir string,
 	previewSelector string,
@@ -195,7 +283,7 @@ func GenerateThunks(
 		ExtraImports:   mergedImports,
 	}
 
-	if err := resolvePreview(&mtd, targetSourceFile, previewSelector); err != nil {
+	if err := resolvePreviewWithExplicit(&mtd, targetSourceFile, previewSelector, previews); err != nil {
 		return nil, err
 	}
 
@@ -249,11 +337,21 @@ func GenerateMainOnlyThunk(
 }
 
 // resolvePreview parses #Preview blocks from targetSourceFile and populates
-// the preview-related fields on mtd. If no previews are found, mtd is unchanged.
+// the preview-related fields on mtd. If no #Preview blocks are found, it uses
+// AST type inspection to find the primary View conforming type in targetSourceFile.
+// If neither exists, it returns a descriptive error (fail fast and loud).
 func resolvePreview(mtd *MainThunkData, targetSourceFile, previewSelector string) error {
-	previews, err := analysis.PreviewBlocks(targetSourceFile)
-	if err != nil {
-		slog.Warn("Failed to parse #Preview blocks", "err", err)
+	return resolvePreviewWithExplicit(mtd, targetSourceFile, previewSelector, nil)
+}
+
+func resolvePreviewWithExplicit(mtd *MainThunkData, targetSourceFile, previewSelector string, explicitPreviews []analysis.PreviewBlock) error {
+	previews := explicitPreviews
+	if len(previews) == 0 {
+		var err error
+		previews, err = analysis.PreviewBlocks(targetSourceFile)
+		if err != nil {
+			slog.Warn("Failed to parse #Preview blocks", "err", err)
+		}
 	}
 	if len(previews) > 0 {
 		selected, err := analysis.SelectPreview(previews, previewSelector)
@@ -264,8 +362,23 @@ func resolvePreview(mtd *MainThunkData, targetSourceFile, previewSelector string
 		mtd.HasPreview = true
 		mtd.PreviewProps = tp.Properties
 		mtd.PreviewBody = tp.BodySource
+		return nil
 	}
-	return nil
+
+	// If no #Preview block exists, inspect AST for a SwiftUI View conforming struct
+	types, _, sErr := analysis.SourceFile(targetSourceFile, nil)
+	if sErr == nil {
+		for _, t := range types {
+			if t.IsView() {
+				mtd.HasPreview = true
+				mtd.PreviewBody = fmt.Sprintf("%s()", t.Name)
+				slog.Info("Resolved primary View struct from AST", "view", t.Name, "file", targetSourceFile)
+				return nil
+			}
+		}
+	}
+
+	return fmt.Errorf("no #Preview block or SwiftUI View conforming struct found in %s", targetSourceFile)
 }
 
 // HasBaseNameCollision reports whether newFile's basename (without extension,
@@ -306,14 +419,19 @@ func writeTemplate(path string, tmpl *template.Template, data any) (retErr error
 
 // cleanOldThunkFiles removes thunk Swift files from a previous cycle.
 func cleanOldThunkFiles(thunkDir string, currentCounter int) {
-	pattern := filepath.Join(thunkDir, fmt.Sprintf("thunk_%d_*.swift", currentCounter))
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		return
+	patterns := []string{
+		filepath.Join(thunkDir, fmt.Sprintf("thunk_%d_*.swift", currentCounter)),
+		filepath.Join(thunkDir, fmt.Sprintf("thunk_%d.swift", currentCounter)),
 	}
-	for _, m := range matches {
-		if err := os.Remove(m); err == nil {
-			slog.Debug("Cleaned old thunk file", "path", m)
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, m := range matches {
+			if err := os.Remove(m); err == nil {
+				slog.Debug("Cleaned old thunk file", "path", m)
+			}
 		}
 	}
 }

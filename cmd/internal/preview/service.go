@@ -1,7 +1,9 @@
 package preview
 
 import (
+	"bufio"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log/slog"
@@ -9,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -264,7 +267,7 @@ func Run(opts RunOptions) error {
 		return err
 	}
 
-	loaderPath, err := codegen.CompileLoader(ctx, dirs.Loader, bs.DeploymentTarget, tc)
+	loaderPath, err := codegen.CompileLoader(ctx, dirs.Loader, bs.DeploymentTarget, bs.TargetArch, tc)
 	if err != nil {
 		sendStopped("build_error", err.Error(), "")
 		return err
@@ -413,12 +416,15 @@ func runOneshot(ctx context.Context, opts RunOptions, br BuildRunner, tc Toolcha
 	if err != nil {
 		return err
 	}
-	defer sess.Close()
+	if !opts.KeepAlive {
+		defer sess.Close()
+	}
 
 	done = step.begin("Capturing preview...")
 	err = sess.CapturePreview(ctx, CaptureRequest{
 		SourceFile:      opts.SourceFile,
 		PreviewSelector: opts.PreviewSelector,
+		FullThunk:       opts.FullThunk,
 		OnReady:         opts.OnReady,
 	})
 	if err == nil && opts.OnScreenshot != nil {
@@ -429,6 +435,146 @@ func runOneshot(ctx context.Context, opts RunOptions, br BuildRunner, tc Toolcha
 		}
 	}
 	done()
+
+	if opts.Daemon && err == nil {
+		slog.Debug("Daemon listening on stdin")
+		scanner := bufio.NewScanner(os.Stdin)
+		scannerBuf := make([]byte, 1024*1024)
+		scanner.Buffer(scannerBuf, 10*1024*1024)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			parts := strings.Fields(line)
+			cmd := parts[0]
+			switch cmd {
+			case "quit", "exit":
+				return nil
+			case "push":
+				if len(parts) < 3 {
+					fmt.Fprintf(os.Stderr, "push error: expected push <path> <base64_data>\n")
+					continue
+				}
+				start := time.Now()
+				target := parts[1]
+				if strings.HasPrefix(target, "~/") {
+					if home, err := os.UserHomeDir(); err == nil {
+						target = filepath.Join(home, target[2:])
+					}
+				}
+				data, dErr := base64.StdEncoding.DecodeString(parts[2])
+				if dErr != nil {
+					fmt.Fprintf(os.Stderr, "push decode error: %v\n", dErr)
+					continue
+				}
+				if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+					fmt.Fprintf(os.Stderr, "push mkdir error: %v\n", err)
+					continue
+				}
+				if err := os.WriteFile(target, data, 0o644); err != nil {
+					fmt.Fprintf(os.Stderr, "push write error: %v\n", err)
+					continue
+				}
+				// Check whether the pushed file contains UI (View conforming type or #Preview).
+				// If it does, update the active preview target to this file.
+				// If it has ZERO UI (e.g. Package.swift, UserModel.swift, API.swift),
+				// do NOT crash or replace opts.SourceFile. Instead, keep opts.SourceFile
+				// as the active view and hot-reload it with the updated dependency.
+				if target == opts.SourceFile || analysis.HasUI(target) {
+					opts.SourceFile = target
+				} else {
+					fmt.Fprintf(os.Stderr, "[axe-daemon] Non-UI dependency updated (%s), refreshing active view (%s)\n", filepath.Base(target), filepath.Base(opts.SourceFile))
+				}
+
+				if target != opts.SourceFile {
+					fmt.Fprintf(os.Stderr, "[axe-daemon] Updating module for pushed dependency (%s)...\n", filepath.Base(target))
+					_ = sess.RebuildModule(ctx)
+				}
+
+				cErr := sess.CapturePreview(ctx, CaptureRequest{
+					SourceFile:      opts.SourceFile,
+					PreviewSelector: opts.PreviewSelector,
+					FullThunk:       opts.FullThunk,
+				})
+				if cErr != nil && strings.Contains(cErr.Error(), "cannot find") && strings.Contains(cErr.Error(), "in scope") {
+					fmt.Fprintf(os.Stderr, "[axe] Missing symbol in %s, auto re-emitting module %s...\n", filepath.Base(opts.SourceFile), sess.ModuleName())
+					if mErr := sess.RebuildModule(ctx); mErr == nil {
+						cErr = sess.CapturePreview(ctx, CaptureRequest{
+							SourceFile:      opts.SourceFile,
+							PreviewSelector: opts.PreviewSelector,
+							FullThunk:       opts.FullThunk,
+						})
+					} else {
+						fmt.Fprintf(os.Stderr, "[axe] Auto module re-emit failed: %v\n", mErr)
+					}
+				}
+				tCapture := time.Since(start)
+				if cErr != nil {
+					fmt.Fprintf(os.Stderr, "push error: %v\n", cErr)
+					continue
+				}
+				tSS := time.Now()
+				if opts.OnScreenshot != nil {
+					if data, sErr := sess.Screenshot(ctx); sErr == nil {
+						_ = opts.OnScreenshot(ctx, data)
+					}
+				}
+				tScreenshot := time.Since(tSS)
+				fmt.Fprintf(os.Stderr, "Push-reload took %.2fs (capture: %.2fs, screenshot: %.2fs)\n", time.Since(start).Seconds(), tCapture.Seconds(), tScreenshot.Seconds())
+			case "reload":
+				start := time.Now()
+				target := opts.SourceFile
+				if len(parts) > 1 {
+					target = parts[1]
+				}
+				cErr := sess.CapturePreview(ctx, CaptureRequest{
+					SourceFile:      target,
+					PreviewSelector: opts.PreviewSelector,
+					FullThunk:       opts.FullThunk,
+				})
+				tCapture := time.Since(start)
+				if cErr != nil {
+					fmt.Fprintf(os.Stderr, "reload error: %v\n", cErr)
+					continue
+				}
+				tSS := time.Now()
+				if opts.OnScreenshot != nil {
+					if data, sErr := sess.Screenshot(ctx); sErr == nil {
+						_ = opts.OnScreenshot(ctx, data)
+					}
+				}
+				tScreenshot := time.Since(tSS)
+				fmt.Fprintf(os.Stderr, "Reload took %.2fs (capture: %.2fs, screenshot: %.2fs)\n", time.Since(start).Seconds(), tCapture.Seconds(), tScreenshot.Seconds())
+			case "switch":
+				if len(parts) > 1 {
+					target := parts[1]
+					if strings.HasPrefix(target, "~/") {
+						if home, err := os.UserHomeDir(); err == nil {
+							target = filepath.Join(home, target[2:])
+						}
+					}
+					opts.SourceFile = target
+				}
+				cErr := sess.CapturePreview(ctx, CaptureRequest{
+					SourceFile:      opts.SourceFile,
+					PreviewSelector: opts.PreviewSelector,
+					FullThunk:       opts.FullThunk,
+				})
+				if cErr != nil {
+					fmt.Fprintf(os.Stderr, "switch error: %v\n", cErr)
+					continue
+				}
+				if opts.OnScreenshot != nil {
+					if data, sErr := sess.Screenshot(ctx); sErr == nil {
+						_ = opts.OnScreenshot(ctx, data)
+					}
+				}
+			}
+		}
+		return scanner.Err()
+	}
+
 	return err
 }
 

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/k-kohey/axe/internal/procgroup"
 )
@@ -18,19 +19,163 @@ import (
 // --- Toolchain ---
 
 // Toolchain executes real toolchain commands (swiftc, clang, codesign, xcrun).
-type Toolchain struct{}
+type Toolchain struct {
+	swiftcPath        string
+	swiftFrontendPath string
+	clangPath         string
+	sdkPaths          map[string]string
+}
 
 func (r *Toolchain) SDKPath(ctx context.Context, sdk string) (string, error) {
+	if r.sdkPaths != nil && r.sdkPaths[sdk] != "" {
+		return r.sdkPaths[sdk], nil
+	}
 	out, err := procgroup.Command(ctx, "xcrun", "--sdk", sdk, "--show-sdk-path").Output()
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	res := strings.TrimSpace(string(out))
+	if r.sdkPaths == nil {
+		r.sdkPaths = make(map[string]string)
+	}
+	r.sdkPaths[sdk] = res
+	return res, nil
+}
+
+func (r *Toolchain) tryFastEmitLibrary(ctx context.Context, args []string) ([]byte, bool) {
+	emitLib := false
+	var dylibPath string
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-emit-library" {
+			emitLib = true
+		} else if args[i] == "-o" && i+1 < len(args) {
+			dylibPath = args[i+1]
+		}
+	}
+	if !emitLib || dylibPath == "" || !strings.HasSuffix(dylibPath, ".dylib") {
+		return nil, false
+	}
+
+	if r.swiftFrontendPath == "" {
+		out, err := procgroup.Command(ctx, "xcrun", "-find", "swift-frontend").Output()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[tryFastEmitLibrary] finding swift-frontend failed: %v\n", err)
+			return nil, false
+		}
+		r.swiftFrontendPath = strings.TrimSpace(string(out))
+	}
+	if r.clangPath == "" {
+		out, err := procgroup.Command(ctx, "xcrun", "-find", "clang").Output()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[tryFastEmitLibrary] finding clang failed: %v\n", err)
+			return nil, false
+		}
+		r.clangPath = strings.TrimSpace(string(out))
+	}
+
+	objPath := strings.TrimSuffix(dylibPath, ".dylib") + ".o"
+	defer os.Remove(objPath)
+
+	var sdk, target string
+	frontendArgs := []string{r.swiftFrontendPath, "-frontend", "-c", "-enable-objc-interop"}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "xcrun" || a == "swiftc" || a == r.swiftcPath || a == "-emit-library" || a == "-no-link-objc-runtime" {
+			continue
+		}
+		if a == "-Xlinker" && i+1 < len(args) {
+			i++
+			continue
+		}
+		if a == "-sdk" && i+1 < len(args) {
+			sdk = args[i+1]
+			frontendArgs = append(frontendArgs, "-sdk", sdk)
+			i++
+			continue
+		}
+		if a == "-target" && i+1 < len(args) {
+			target = args[i+1]
+			frontendArgs = append(frontendArgs, "-target", target)
+			i++
+			continue
+		}
+		if a == "-L" && i+1 < len(args) {
+			i++
+			continue
+		}
+		if a == "-Xfrontend" && i+1 < len(args) {
+			frontendArgs = append(frontendArgs, args[i+1])
+			i++
+			continue
+		}
+		if a == "-o" && i+1 < len(args) {
+			frontendArgs = append(frontendArgs, "-o", objPath)
+			i++
+			continue
+		}
+		frontendArgs = append(frontendArgs, a)
+	}
+
+	tFast := time.Now()
+	outF, errF := procgroup.Command(ctx, frontendArgs[0], frontendArgs[1:]...).CombinedOutput()
+	if errF != nil {
+		fmt.Fprintf(os.Stderr, "[tryFastEmitLibrary] swift-frontend failed: %v\nOutput: %s\n", errF, string(outF))
+		return outF, false
+	}
+
+	clangArgs := []string{
+		r.clangPath,
+		"-dynamiclib",
+		objPath,
+		"-O0",
+		"--sysroot", sdk,
+		"--target=" + target,
+		"-L", filepath.Join(sdk, "usr", "lib", "swift"),
+		"-rpath", "/usr/lib/swift",
+		"-Xlinker", "-undefined", "-Xlinker", "suppress",
+		"-Xlinker", "-flat_namespace",
+		"-o", dylibPath,
+	}
+
+	outC, errC := procgroup.Command(ctx, clangArgs[0], clangArgs[1:]...).CombinedOutput()
+	if errC != nil {
+		fmt.Fprintf(os.Stderr, "[tryFastEmitLibrary] clang failed: %v\nOutput: %s\nArgs: %v\n", errC, string(outC), clangArgs)
+		return outC, false
+	}
+
+	fmt.Fprintf(os.Stderr, "[tryFastEmitLibrary] DIRECT COMPILE SUCCESS: swift-frontend + clang took %.3fs\n", time.Since(tFast).Seconds())
+	return append(outF, outC...), true
 }
 
 func (r *Toolchain) CompileSwift(ctx context.Context, args []string) ([]byte, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("empty command args")
+	}
+	if out, ok := r.tryFastEmitLibrary(ctx, args); ok {
+		return out, nil
+	}
+	if len(args) >= 2 && args[0] == "xcrun" {
+		if args[1] == "swift-frontend" {
+			if r.swiftFrontendPath == "" {
+				out, err := procgroup.Command(ctx, "xcrun", "-find", "swift-frontend").Output()
+				if err == nil {
+					r.swiftFrontendPath = strings.TrimSpace(string(out))
+				}
+			}
+			if r.swiftFrontendPath != "" {
+				args = append([]string{r.swiftFrontendPath}, args[2:]...)
+			}
+		} else if args[1] == "swiftc" {
+			if r.swiftcPath == "" {
+				out, err := procgroup.Command(ctx, "xcrun", "-find", "swiftc").Output()
+				if err == nil {
+					r.swiftcPath = strings.TrimSpace(string(out))
+				}
+			}
+			if r.swiftcPath != "" {
+				args = append([]string{r.swiftcPath}, args[2:]...)
+			}
+		}
 	}
 	return procgroup.Command(ctx, args[0], args[1:]...).CombinedOutput()
 }
@@ -38,6 +183,17 @@ func (r *Toolchain) CompileSwift(ctx context.Context, args []string) ([]byte, er
 func (r *Toolchain) CompileC(ctx context.Context, args []string) ([]byte, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("empty command args")
+	}
+	if len(args) >= 2 && args[0] == "xcrun" && args[1] == "clang" {
+		if r.clangPath == "" {
+			out, err := procgroup.Command(ctx, "xcrun", "-find", "clang").Output()
+			if err == nil {
+				r.clangPath = strings.TrimSpace(string(out))
+			}
+		}
+		if r.clangPath != "" {
+			args = append([]string{r.clangPath}, args[2:]...)
+		}
 	}
 	return procgroup.Command(ctx, args[0], args[1:]...).CombinedOutput()
 }

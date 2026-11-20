@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -206,6 +207,9 @@ func combineWithIndexStore(indexData *pb.IndexFileData, parserResult *pb.ParseRe
 						"line", idxMember.GetLine())
 					continue
 				}
+				if ms.GetName() == "init" || strings.HasPrefix(ms.GetSelector(), "init(") {
+					continue
+				}
 				resolvedTypeCounts[ms.GetTypeName()]++
 				ti.Methods = append(ti.Methods, MethodInfo{
 					Name:      ms.GetName(),
@@ -384,6 +388,69 @@ func pickMemberCandidate(
 	return nil
 }
 
+func typesFromParserResult(parserResult *pb.ParseResult) []TypeInfo {
+	if parserResult == nil {
+		return nil
+	}
+	typeMap := make(map[string]*TypeInfo)
+	var typeOrder []string
+
+	for _, ms := range parserResult.GetMemberSources() {
+		typeName := ms.GetTypeName()
+		if typeName == "" {
+			continue
+		}
+		ti, exists := typeMap[typeName]
+		if !exists {
+			access := "internal"
+			if parserResult.GetTypeAccessLevels() != nil {
+				if a, ok := parserResult.GetTypeAccessLevels()[typeName]; ok && a != "" {
+					access = a
+				}
+			}
+			ti = &TypeInfo{
+				Name:           typeName,
+				Kind:           "struct",
+				AccessLevel:    access,
+				InheritedTypes: []string{"View"},
+			}
+			typeMap[typeName] = ti
+			typeOrder = append(typeOrder, typeName)
+		}
+
+		switch ms.GetKind() {
+		case pb.MemberSourceKind_MEMBER_SOURCE_KIND_PROPERTY:
+			typeExpr := ms.GetTypeExpr()
+			if typeExpr == "" {
+				typeExpr = "some View"
+			}
+			ti.Properties = append(ti.Properties, PropertyInfo{
+				Name:     ms.GetName(),
+				TypeExpr: typeExpr,
+				BodyLine: int(ms.GetBodyLine()),
+				Source:   ms.GetSource(),
+			})
+		case pb.MemberSourceKind_MEMBER_SOURCE_KIND_METHOD:
+			if ms.GetName() == "init" || strings.HasPrefix(ms.GetSelector(), "init(") {
+				continue
+			}
+			ti.Methods = append(ti.Methods, MethodInfo{
+				Name:      ms.GetName(),
+				Selector:  ms.GetSelector(),
+				Signature: ms.GetSignature(),
+				BodyLine:  int(ms.GetBodyLine()),
+				Source:    ms.GetSource(),
+			})
+		}
+	}
+
+	var res []TypeInfo
+	for _, name := range typeOrder {
+		res = append(res, *typeMap[name])
+	}
+	return res
+}
+
 // SourceFile parses types and imports from a Swift source file.
 // It requires an Index Store cache for semantic filtering.
 // It requires at least one View type with a body property.
@@ -399,6 +466,10 @@ func SourceFile(path string, cache *IndexStoreCache) ([]TypeInfo, []string, erro
 		if indexData != nil {
 			types = combineWithIndexStore(indexData, result)
 		}
+	}
+
+	if len(types) == 0 {
+		types = typesFromParserResult(result)
 	}
 
 	// Require at least one View type with a body property.
@@ -475,6 +546,23 @@ func DependencyFile(path string, cache *IndexStoreCache) ([]TypeInfo, []string, 
 			types = combineWithIndexStore(indexData, result)
 		}
 	}
+	if len(types) == 0 {
+		types = typesFromParserResult(result)
+	}
 
 	return types, result.GetImports(), nil
+}
+
+// HasUI returns true if the Swift file contains at least one SwiftUI View conforming
+// type with a body property or at least one #Preview block.
+func HasUI(path string) bool {
+	if filepath.Base(path) == "Package.swift" {
+		return false
+	}
+	blocks, _ := PreviewBlocks(path)
+	if len(blocks) > 0 {
+		return true
+	}
+	types, _, err := SourceFile(path, nil)
+	return err == nil && len(types) > 0
 }

@@ -873,3 +873,44 @@ func TestTypeInfo_IsView(t *testing.T) {
 		})
 	}
 }
+
+func TestGenerateUnifiedThunks_SingleFile(t *testing.T) {
+	thunkDir := t.TempDir()
+	files := []analysis.FileThunkData{
+		{
+			FileName: "TestingView.swift",
+			AbsPath:  "/path/to/TestingView.swift",
+			Types: []analysis.TypeInfo{
+				{
+					Name:           "TestingView",
+					InheritedTypes: []string{"View"},
+					Properties: []analysis.PropertyInfo{
+						{Name: "body", TypeExpr: "some View", BodyLine: 5, Source: "        Text(\"Hello\")"},
+					},
+				},
+			},
+		},
+	}
+	previews := []analysis.PreviewBlock{
+		{StartLine: 10, Source: "    TestingView()"},
+	}
+
+	paths, err := GenerateUnifiedThunks(files, previews, "TestModule", thunkDir, "", "/path/to/TestingView.swift", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("expected 1 unified thunk path, got %d", len(paths))
+	}
+	content, err := os.ReadFile(paths[0])
+	if err != nil {
+		t.Fatalf("reading thunk file: %v", err)
+	}
+	str := string(content)
+	if !strings.Contains(str, "@_dynamicReplacement(for: body)") {
+		t.Errorf("expected dynamic replacement for body in unified thunk")
+	}
+	if !strings.Contains(str, "_axePreviewRefresh") {
+		t.Errorf("expected _axePreviewRefresh in unified thunk")
+	}
+}
